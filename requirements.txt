@@ -1,0 +1,9 @@
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+google-genai
+gspread
+feedparser
+slack_sdk
+python-dotenv
+PyPDF2

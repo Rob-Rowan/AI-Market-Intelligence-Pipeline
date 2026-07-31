@@ -1,0 +1,30 @@
+# Environments
+venv/
+env/
+.venv/
+.env
+
+# API Keys & Secrets
+credentials.json
+client_secret.json
+
+# Databases (DO NOT UPLOAD YOUR TRADES!)
+*.db
+*.sqlite3
+trading_journal.db
+trades.db
+
+# Data Caches
+*.parquet
+market_data_vault/
+*.csv
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDEs and OS Files
+.vscode/
+.idea/
+.DS_Store
