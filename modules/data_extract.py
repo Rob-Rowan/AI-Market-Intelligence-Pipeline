@@ -1,38 +1,55 @@
-"""Data extraction and deduplication for RSS feeds and Google Drive."""
+"""RSS and Google Drive ingestion with in-memory MD5 deduplication."""
+
+from __future__ import annotations
 
 import hashlib
 import io
+import logging
+import socket
 
 import feedparser
 import gspread
 import PyPDF2
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 from core.google_services import AutomationServices
 
+logger = logging.getLogger(__name__)
+
+_TRANSIENT_API_ERRORS = (
+    socket.timeout,
+    HttpError,
+    gspread.exceptions.APIError,
+)
+
+_EXTRACTION_ERRORS = _TRANSIENT_API_ERRORS + (
+    PyPDF2.errors.PyPdfError,
+    UnicodeDecodeError,
+)
+
 
 class DataExtractor:
-    """Fetch new items from an RSS feed or Google Drive folder while
-    avoiding duplicates via an MD5 hash memory layer stored in a Google
-    Sheet.
+    """Fetch new items from an RSS feed or a Google Drive folder.
+
+    Deduplication runs entirely in memory: the set of previously
+    processed MD5 hashes is loaded from the ``Deduplication_Hashes``
+    worksheet once per run, then checked with O(1) set lookups so the
+    Google Sheets API is never queried inside the file loop.
 
     Attributes:
         services: An authenticated :class:`AutomationServices` instance.
-        sheet: The ``Deduplication_Hashes`` worksheet from the
-            configured Google Sheet.
+        sheet: The ``Deduplication_Hashes`` worksheet.
     """
 
-    def __init__(
-        self, services: AutomationServices, sheet_id: str
-    ) -> None:
-        """Initialise the DataExtractor.
+    def __init__(self, services: AutomationServices, sheet_id: str) -> None:
+        """Initialise the extractor and resolve the dedup worksheet.
 
         Args:
             services: An authenticated :class:`AutomationServices`
                 instance.
-            sheet_id: The ID of the Google Sheet whose
-                ``Deduplication_Hashes`` worksheet stores processed
-                item hashes.
+            sheet_id: ID of the Google Sheet that owns the
+                ``Deduplication_Hashes`` worksheet.
         """
         self.services = services
         self.sheet = (
@@ -40,96 +57,111 @@ class DataExtractor:
             .worksheet("Deduplication_Hashes")
         )
 
-    def _get_processed_hashes(self) -> set[str]:
-        """Retrieve all MD5 hashes from Column A of the dedup sheet.
+    def _get_processed_hashes(self) -> set[str] | None:
+        """Load every processed MD5 hash into an in-memory set.
 
         Returns:
-            A set of hash strings representing previously processed
-            items. Returns an empty set on error.
+            The set of previously processed item hashes, or ``None`` if
+            the worksheet cannot be read. ``None`` lets callers abort a
+            run instead of reprocessing already-processed items, which
+            protects API quota during a Sheets outage.
         """
         try:
             hashes = self.sheet.col_values(1)[1:]  # skip header row
             return set(hashes)
-        except gspread.exceptions.APIError as e:
-            print(f"Error reading from Google Sheet: {e}")
-            return set()
+        except Exception:
+            logger.exception(
+                "Failed to read deduplication hashes from Google Sheets."
+            )
+            return None
 
     def _generate_hash(self, url: str, title: str) -> str:
-        """Generate an MD5 hash from a URL and title.
+        """Generate a deterministic MD5 hash for an item.
 
         Args:
-            url: The URL of the item.
-            title: The title of the item.
+            url: The item URL (or Google Drive file ID).
+            title: The item title.
 
         Returns:
-            The MD5 hex digest string.
+            The MD5 hex digest used for deduplication.
         """
-        combined = f"{url}{title}"
-        return hashlib.md5(combined.encode("utf-8")).hexdigest()
+        return hashlib.md5(f"{url}{title}".encode("utf-8")).hexdigest()
 
-    def fetch_new_rss_items(self, rss_url: str) -> list[dict]:
-        """Fetch items from an RSS feed that have not been processed yet.
+    def fetch_new_rss_items(self, rss_url: str) -> list[dict[str, str]]:
+        """Return feed entries that have not been processed yet.
 
         Args:
             rss_url: The URL of the RSS feed to parse.
 
         Returns:
-            A list of dictionaries, each with keys ``title``, ``link``,
-            ``summary``, and ``hash``, representing new items not found
-            in the deduplication sheet.
+            A list of new items with keys ``title``, ``link``,
+            ``summary``, and ``hash``.
         """
         processed_hashes = self._get_processed_hashes()
-        new_items: list[dict] = []
+        if processed_hashes is None:
+            logger.error(
+                "Deduplication state unavailable; aborting RSS fetch."
+            )
+            return []
 
         try:
             feed = feedparser.parse(rss_url)
-            if feed.bozo:
-                raise feed.bozo_exception
-        except Exception as e:
-            print(f"Error parsing RSS feed at {rss_url}: {e}")
+        except Exception:
+            logger.exception("Failed to parse RSS feed at %s.", rss_url)
+            return []
+        if feed.bozo:
+            logger.warning(
+                "RSS feed at %s reported a parser issue: %s",
+                rss_url,
+                feed.bozo_exception,
+            )
             return []
 
+        new_items: list[dict[str, str]] = []
         for entry in feed.entries:
             item_hash = self._generate_hash(entry.link, entry.title)
-
-            if item_hash not in processed_hashes:
-                summary = entry.get(
-                    "summary",
-                    entry.get("content", [{}])[0].get("value", ""),
-                )
-                new_items.append(
-                    {
-                        "title": entry.title,
-                        "link": entry.link,
-                        "summary": summary,
-                        "hash": item_hash,
-                    }
-                )
-
+            if item_hash in processed_hashes:
+                continue
+            summary = entry.get(
+                "summary",
+                entry.get("content", [{}])[0].get("value", ""),
+            )
+            new_items.append(
+                {
+                    "title": entry.title,
+                    "link": entry.link,
+                    "summary": summary,
+                    "hash": item_hash,
+                }
+            )
         return new_items
 
-    def fetch_drive_transcripts(self, folder_id: str) -> list[dict]:
-        """Scan a Google Drive folder for new PDF / TXT files.
+    def fetch_drive_transcripts(
+        self, folder_id: str
+    ) -> list[dict[str, str]]:
+        """Scan a Google Drive folder for new PDF/TXT transcripts.
 
-        Downloads each file, extracts its text content, and returns a
-        list of items formatted identically to RSS entries for the
-        downstream AI pipeline.
+        The deduplication set is loaded once before the file loop so
+        per-file lookups never hit the Google Sheets API.
 
         Args:
             folder_id: The ID of the Google Drive folder to scan.
 
         Returns:
-            A list of dictionaries, each with keys ``title``,
-            ``link``, ``summary``, and ``hash``, representing new
-            transcripts not yet processed.
+            A list of new transcripts with keys ``title``, ``link``,
+            ``summary``, and ``hash``.
         """
-        print(
-            f"Scanning Google Drive folder {folder_id} for transcripts..."
+        logger.info(
+            "Scanning Drive folder %s for PDF/TXT transcripts.", folder_id
         )
-        new_transcripts: list[dict] = []
+        processed_hashes = self._get_processed_hashes()
+        if processed_hashes is None:
+            logger.error(
+                "Deduplication state unavailable; aborting Drive scan."
+            )
+            return []
 
         try:
-            # Query Drive for PDFs and TXTs in the specified folder
             query = (
                 f"'{folder_id}' in parents "
                 "and (mimeType='application/pdf' "
@@ -141,67 +173,73 @@ class DataExtractor:
                 .list(q=query, fields="files(id, name, mimeType)")
                 .execute()
             )
-            items = results.get("files", [])
-
-            if not items:
-                print("No transcripts found in folder.")
-                return new_transcripts
-
-            for item in items:
-                file_id = item["id"]
-                file_name = item["name"]
-                mime_type = item["mimeType"]
-
-                # Generate a unique hash for the file
-                file_hash = self._generate_hash(file_name, file_id)
-
-                # Check deduplication memory layer
-                existing_hashes = self.sheet.col_values(1)
-                if file_hash in existing_hashes:
-                    print(f"Skipping duplicate transcript: {file_name}")
-                    continue
-
-                print(
-                    f"Downloading and reading transcript: {file_name}"
-                )
-
-                # Download the file from Google Drive into memory
-                request = self.services.drive_service.files().get_media(
-                    fileId=file_id
-                )
-                file_stream = io.BytesIO()
-                downloader = MediaIoBaseDownload(file_stream, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-
-                file_stream.seek(0)
-                extracted_text = ""
-
-                # Parse the text based on file type
-                if mime_type == "application/pdf":
-                    pdf_reader = PyPDF2.PdfReader(file_stream)
-                    for page in pdf_reader.pages:
-                        extracted_text += page.extract_text() + "\n"
-                elif mime_type == "text/plain":
-                    extracted_text = (
-                        file_stream.read().decode("utf-8")
-                    )
-
-                new_transcripts.append(
-                    {
-                        "title": f"TRANSCRIPT: {file_name}",
-                        "link": (
-                            "https://drive.google.com/file/d/"
-                            f"{file_id}/view"
-                        ),
-                        "summary": extracted_text[:15000],
-                        "hash": file_hash,
-                    }
-                )
-
-            return new_transcripts
-
-        except Exception as e:
-            print(f"Error fetching transcripts from Drive: {e}")
+        except _TRANSIENT_API_ERRORS:
+            logger.exception(
+                "Failed to list files in Drive folder %s.", folder_id
+            )
             return []
+
+        new_transcripts: list[dict[str, str]] = []
+        for item in results.get("files", []):
+            file_id = item["id"]
+            file_name = item["name"]
+            mime_type = item["mimeType"]
+            file_hash = self._generate_hash(file_name, file_id)
+
+            if file_hash in processed_hashes:
+                logger.debug("Skipping duplicate transcript: %s", file_name)
+                continue
+
+            try:
+                extracted_text = self._extract_file_text(
+                    file_id, mime_type
+                )
+            except _EXTRACTION_ERRORS:
+                logger.exception(
+                    "Failed to download or parse transcript %s.",
+                    file_name,
+                )
+                continue
+
+            new_transcripts.append(
+                {
+                    "title": f"TRANSCRIPT: {file_name}",
+                    "link": (
+                        "https://drive.google.com/file/d/"
+                        f"{file_id}/view"
+                    ),
+                    "summary": extracted_text[:15000],
+                    "hash": file_hash,
+                }
+            )
+        return new_transcripts
+
+    def _extract_file_text(self, file_id: str, mime_type: str) -> str:
+        """Download a Drive file into memory and extract its text.
+
+        Args:
+            file_id: The Google Drive file ID.
+            mime_type: The file MIME type (``application/pdf`` or
+                ``text/plain``).
+
+        Returns:
+            The extracted text content.
+        """
+        request = self.services.drive_service.files().get_media(
+            fileId=file_id
+        )
+        file_stream = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_stream, request)
+        while True:
+            _, done = downloader.next_chunk()
+            if done:
+                break
+
+        file_stream.seek(0)
+        if mime_type == "application/pdf":
+            reader = PyPDF2.PdfReader(file_stream)
+            return "".join(
+                f"{page.extract_text() or ''}\n"
+                for page in reader.pages
+            )
+        return file_stream.read().decode("utf-8")

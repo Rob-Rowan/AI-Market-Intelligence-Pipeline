@@ -1,31 +1,44 @@
-"""Google Cloud service authentication and client initialization."""
+"""Google Cloud service authentication and client initialisation."""
 
+from __future__ import annotations
+
+import logging
 import os
+import socket
 
+import gspread
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.discovery import Resource
-import gspread
+from googleapiclient.discovery import Resource, build
+from googleapiclient.errors import HttpError
 from gspread.client import Client
 from slack_sdk import WebClient
+
+logger = logging.getLogger(__name__)
+
+_GOOGLE_AUTH_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
 
 class AutomationServices:
     """Authorised clients for Google Workspace and Slack services.
 
-    Initialises and manages connections to Google Sheets, Drive, Docs,
-    Gmail, and Slack using a service account credentials file and
-    environment variables.
+    Builds all Google API clients from a service-account credentials
+    file and optionally a Slack ``WebClient`` from the ``SLACK_BOT_TOKEN``
+    environment variable.
 
     Attributes:
         credentials_path: Path to the Google service account JSON file.
-        env_path: Path to the .env file containing secret tokens.
+        env_path: Path to the ``.env`` file containing secret tokens.
         gspread_client: Authenticated gspread :class:`Client` instance.
         drive_service: Google Drive API v3 :class:`Resource` instance.
         docs_service: Google Docs API v1 :class:`Resource` instance.
         gmail_service: Google Gmail API v1 :class:`Resource` instance.
-        slack_client: Slack :class:`WebClient` instance (or None).
+        slack_client: Slack :class:`WebClient` instance or ``None``.
     """
 
     def __init__(
@@ -33,14 +46,15 @@ class AutomationServices:
         credentials_path: str = "credentials.json",
         env_path: str = ".env",
     ) -> None:
-        """Initialise AutomationServices and authenticate all clients.
+        """Load environment variables and authenticate all services.
 
         Args:
-            credentials_path: Relative path to the Google service
-                account credentials JSON file. Defaults to
-                ``"credentials.json"``.
-            env_path: Relative path to the ``.env`` file containing
-                ``SLACK_BOT_TOKEN`` et al. Defaults to ``".env"``.
+            credentials_path: Path to the Google service account
+                credentials JSON file.
+            env_path: Path to the ``.env`` file containing secret tokens.
+
+        Raises:
+            RuntimeError: If Google service authentication fails.
         """
         self.credentials_path = credentials_path
         self.env_path = env_path
@@ -51,79 +65,60 @@ class AutomationServices:
         self.slack_client: WebClient | None = None
 
         self._load_env()
-        self._authenticate()
+        self._authenticate_google()
+        self._authenticate_slack()
 
     def _load_env(self) -> None:
-        """Load environment variables from the ``.env`` file."""
-        try:
-            load_dotenv(dotenv_path=self.env_path)
-            print("Successfully loaded .env file.")
-        except Exception as e:
-            print(f"Error loading .env file: {e}")
+        """Load environment variables from the ``.env`` file, if present."""
+        load_dotenv(dotenv_path=self.env_path)
+        logger.info("Loaded environment variables from %s.", self.env_path)
 
-    def _authenticate(self) -> None:
-        """Authenticate and initialise all Google and Slack service clients.
+    def _authenticate_google(self) -> None:
+        """Build the gspread, Drive, Docs, and Gmail API clients.
 
         Raises:
-            Exception: Propagates any authentication or API
-                initialisation failure.
+            RuntimeError: If any Google client fails to initialise.
         """
         try:
-            scopes = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-                "https://www.googleapis.com/auth/documents",
-                "https://www.googleapis.com/auth/gmail.send",
-            ]
-
             creds = Credentials.from_service_account_file(
-                self.credentials_path, scopes=scopes
+                self.credentials_path, scopes=_GOOGLE_AUTH_SCOPES
             )
-
-            # Initialise gspread
             self.gspread_client = gspread.authorize(creds)
-            print("Successfully initialised gspread client.")
-
-            # Initialise Google Drive API
             self.drive_service = build("drive", "v3", credentials=creds)
-            print("Successfully initialised Google Drive API client.")
-
-            # Initialise Google Docs API
             self.docs_service = build("docs", "v1", credentials=creds)
-            print("Successfully initialised Google Docs API client.")
-
-            # Initialise Google Gmail API
             self.gmail_service = build("gmail", "v1", credentials=creds)
-            print("Successfully initialised Google Gmail API client.")
-
-        except Exception as e:
-            print(
-                f"An error occurred during Google services authentication: {e}"
+        except (socket.timeout, HttpError) as exc:
+            logger.error(
+                "Transient network failure while authenticating Google "
+                "services: %s",
+                exc,
             )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Google service authentication failed; verify %s "
+                "exists and is shared with the target sheet/docs.",
+                self.credentials_path,
+            )
+            raise RuntimeError(
+                f"Google service authentication failed: {exc}"
+            ) from exc
 
+        logger.info(
+            "Initialised gspread, Drive, Docs, and Gmail clients."
+        )
+
+    def _authenticate_slack(self) -> None:
+        """Initialise the Slack client if ``SLACK_BOT_TOKEN`` is set."""
+        slack_bot_token = os.getenv("SLACK_BOT_TOKEN")
+        if not slack_bot_token:
+            logger.warning(
+                "SLACK_BOT_TOKEN not set; Slack notifications disabled."
+            )
+            return
         try:
-            # Initialise Slack SDK
-            slack_bot_token = os.getenv("SLACK_BOT_TOKEN")
-            if slack_bot_token:
-                self.slack_client = WebClient(token=slack_bot_token)
-                print("Successfully initialised Slack client.")
-            else:
-                print(
-                    "SLACK_BOT_TOKEN not found in .env file. "
-                    "Slack client not initialised."
-                )
-        except Exception as e:
-            print(
-                f"An error occurred during Slack client initialisation: {e}"
-            )
-
-
-if __name__ == "__main__":
-    if not os.path.exists("credentials.json"):
-        with open("credentials.json", "w") as f:
-            f.write("{}")
-    if not os.path.exists(".env"):
-        with open(".env", "w") as f:
-            f.write("SLACK_BOT_TOKEN=your_slack_bot_token")
-
-    services = AutomationServices()
+            self.slack_client = WebClient(token=slack_bot_token)
+        except Exception as exc:
+            logger.error("Failed to initialise Slack client: %s", exc)
+            return
+        logger.info("Initialised Slack client.")
